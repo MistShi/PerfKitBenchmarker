@@ -1,4 +1,4 @@
-# Copyright 2015 Zi Shen Lim. All rights reserved.
+# Copyright 2015 Google Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Contributed by: Zi Shen Lim.
 
 """Runs SciMark2.
 
@@ -32,16 +34,29 @@ from perfkitbenchmarker import regex_util
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 
-SCIMARK2_URL = 'https://github.com/zlim/scimark2/archive/master.zip'
-SCIMARK2_ZIP = '{0}/scimark2-master.zip'.format(vm_util.VM_TMP_DIR)
-SCIMARK2_PATH = '{0}/scimark2-master'.format(vm_util.VM_TMP_DIR)
+# Use this directory for all data stored in the VM for this test.
+SCIMARK2_PATH = '{0}/scimark2'.format(vm_util.VM_TMP_DIR)
+
+# Download location for both the C and Java tests.
+SCIMARK2_BASE_URL = 'http://math.nist.gov/scimark2'
+
+# Java-specific constants.
+SCIMARK2_JAVA_JAR = 'scimark2lib.jar'
+SCIMARK2_JAVA_MAIN = 'jnt.scimark2.commandline'
+
+# C-specific constants.
+SCIMARK2_C_ZIP = 'scimark2_1c.zip'
+SCIMARK2_C_SRC = '{0}/src'.format(SCIMARK2_PATH)
+# SciMark2 does not set optimization flags, it leaves this to the
+# discretion of the tester. The following gets good performance and
+# has been used for LLVM and GCC regression testing, see for example
+# https://llvm.org/bugs/show_bug.cgi?id=22589 .
+SCIMARK2_C_CFLAGS = '-O3 -march=native'
 
 BENCHMARK_INFO = {'name': 'scimark2',
                   'description': 'Runs SciMark2',
                   'scratch_disk': False,
                   'num_machines': 1}
-
-TEST_PARSE_RESULTS = False
 
 
 def GetInfo():
@@ -64,13 +79,18 @@ def Prepare(benchmark_spec):
   logging.info('Preparing SciMark2 on %s', vm)
   vm.Install('build_tools')
   vm.Install('wget')
+  vm.Install('openjdk7')
   vm.InstallPackages('unzip')
   cmds = [
-      'wget {0} -O {1}'.format(SCIMARK2_URL, SCIMARK2_ZIP),
-      '(cd {0} && rm -rf {1} && unzip {2})'.format(
-          vm_util.VM_TMP_DIR, SCIMARK2_PATH, SCIMARK2_ZIP),
-      '(cd {0} && make build_c)'.format(SCIMARK2_PATH),
-      '(cd {0} && make build_java)'.format(SCIMARK2_PATH)
+      'rm -rf {0} && mkdir {0}'.format(SCIMARK2_PATH),
+      'wget {0}/{1} -O {2}/{1}'.format(
+          SCIMARK2_BASE_URL, SCIMARK2_JAVA_JAR, SCIMARK2_PATH),
+      'wget {0}/{1} -O {2}/{1}'.format(
+          SCIMARK2_BASE_URL, SCIMARK2_C_ZIP, SCIMARK2_PATH),
+      '(mkdir {0} && cd {0} && unzip {1}/{2})'.format(
+          SCIMARK2_C_SRC, SCIMARK2_PATH, SCIMARK2_C_ZIP),
+      '(cd {0} && make CFLAGS="{1}")'.format(
+          SCIMARK2_C_SRC, SCIMARK2_C_CFLAGS)
   ]
   for cmd in cmds:
     vm.RemoteCommand(cmd, should_log=True)
@@ -90,12 +110,21 @@ def Run(benchmark_spec):
   vm = vms[0]
   logging.info('Running SciMark2 on %s', vm)
   samples = []
-  if TEST_PARSE_RESULTS:
-    samples.extend(TestParseResults())
-    return samples
+  # Run the Java and C benchmarks twice each, once with defaults and
+  # once with the "-large" flag to use a larger working set size.
+  #
+  # Since the default output is not very parsing-friendly, print an
+  # extra header to identify the tests. This must match
+  # RESULT_START_REGEX as used below.
   cmds = [
-      '(cd {0} && make c)'.format(SCIMARK2_PATH),
-      '(cd {0} && make java)'.format(SCIMARK2_PATH)
+      '(echo ";;; Java small"; cd {0} && java -cp {1} {2})'.format(
+          SCIMARK2_PATH, SCIMARK2_JAVA_JAR, SCIMARK2_JAVA_MAIN),
+      '(echo ";;; C small"; cd {0} && ./scimark2)'.format(
+          SCIMARK2_C_SRC),
+      '(echo ";;; Java large"; cd {0} && java -cp {1} {2} -large)'.format(
+          SCIMARK2_PATH, SCIMARK2_JAVA_JAR, SCIMARK2_JAVA_MAIN),
+      '(echo ";;; C large"; cd {0} && ./scimark2 -large)'.format(
+          SCIMARK2_C_SRC),
   ]
   for cmd in cmds:
     stdout, _ = vm.RemoteCommand(cmd, should_log=True)
@@ -129,6 +158,8 @@ def ParseResults(results):
     Sparse matmult  Mflops:  1974.39    (N=1000, nz=5000)
     LU              Mflops:  2899.56    (M=100, N=100)
 
+  (Yes, "kenel" is part of the original output.)
+
   Sample Results (Java version):
 
     SciMark 2.0a
@@ -152,114 +183,106 @@ def ParseResults(results):
   Returns:
     A list of sample.Sample objects.
   """
-  RESULT_START_C = '** SciMark2 Numeric Benchmark'
-  RESULT_START_JAVA = 'SciMark 2.0a'
+  RESULT_START_REGEX = re.compile(r'^;;; \s+ (.*)', re.X | re.M)
 
-  SCORE_REGEX = r'\n(Composite Score):\s+(\d+\.\d+)'
-  RESULT_REGEX_C = r'\n(.+?)\s+Mflops:\s+(\d+\.\d+)(\s+\(.+?\))?'
-  RESULT_REGEX_JAVA = r'\n([^:]+):\s+(\d+\.\d+)'
-  PLATFORM_REGEX = r'\n(\w+\.\w+):\s+(.*)'
+  SCORE_REGEX = re.compile(r'''
+    ^ (Composite \s+ Score) : \s+ (\d+ \. \d+)
+  ''', re.X | re.M)
+  RESULT_REGEX_C = re.compile(r'''
+    ^
+    ( .+? ) \s+  #1: Test name
+    Mflops: \s+
+    ( \d+ \. \d+ )  #2: Test score
+    ( \s+ \( .+? \) )?  #3: Optional test details
+  ''', re.X | re.M)
+  RESULT_REGEX_JAVA = re.compile(r'''
+    ^
+    ( .+? )  #1: Test name
+    : \s+
+    ( \d+ \. \d+ )  #2: Test score
+  ''', re.X | re.M)
+  PLATFORM_REGEX = re.compile(r'''
+    ^
+    ( \w+ \. \w+ )  #1: Property name
+    : \s+
+    ( .* )  #2: Property value
+  ''', re.X | re.M)
 
   def FindBenchStart(results, start_index=0):
-    bench_version = 'Unknown'
-    index = results.find(RESULT_START_C, start_index)
-    if index != -1:
-      bench_version = 'C'
-    else:
-      index = results.find(RESULT_START_JAVA, start_index)
-      if index != -1:
-        bench_version = 'Java'
-    return index, bench_version
+    m = RESULT_START_REGEX.search(results, start_index)
+    if m is None:
+      return -1, 'Unknown'
+    return m.start(), m.group(1)
 
-  def ExtractPlatform(result, bench_version, clear=True):
-    metadata = dict()
-    if bench_version == 'C':
+  def ExtractPlatform(result, bench_version):
+    metadata = {}
+    meta_start = None
+    if bench_version.startswith('C'):
       pass
-    elif bench_version == 'Java':
-      matches = re.finditer(PLATFORM_REGEX, result)
-      for m in matches:
-        metadata.update({m.group(1): m.group(2)})
-        if clear:
-          result = result[:m.start()] + ' ' * (m.end() - m.start()) + \
-              result[m.end():]
-    return metadata, result
+    elif bench_version.startswith('Java'):
+      for m in PLATFORM_REGEX.finditer(result):
+        if meta_start is None:
+          meta_start = m.start()
+        metadata[m.group(1)] = m.group(2)
+    return metadata, meta_start
 
-  def ExtractScore(result, bench_version, clear=True):
-    m = re.search(SCORE_REGEX, result)
+  def ExtractScore(result, bench_version):
+    m = SCORE_REGEX.search(result)
     label = m.group(1)
     score = float(m.group(2))
-    if clear:
-      result = result[:m.start()] + ' ' * (m.end() - m.start()) + \
-          result[m.end():]
-    return score, label, result
+    return score, label, m.end()
 
   def ExtractResults(result, bench_version):
     datapoints = []
-    if bench_version == 'C':
-      match = regex_util.ExtractAllMatches(RESULT_REGEX_C, result)
-      for groups in match:
+    if bench_version.startswith('C'):
+      for groups in regex_util.ExtractAllMatches(RESULT_REGEX_C, result):
         metric = '{0} {1}'.format(groups[0].strip(), groups[2].strip())
-        metric = metric.strip().strip(':')
+        metric = metric.strip().strip(':')  # Extra ':' in 'MonteCarlo:'.
         value = float(groups[1])
         datapoints.append((metric, value))
-    elif bench_version == 'Java':
-      match = regex_util.ExtractAllMatches(RESULT_REGEX_JAVA, result)
-      for groups in match:
+    elif bench_version.startswith('Java'):
+      for groups in regex_util.ExtractAllMatches(RESULT_REGEX_JAVA, result):
         datapoints.append((groups[0].strip(), float(groups[1])))
     return datapoints
 
+  # Find start positions for all the test results.
+  tests = []
+  test_start_pos = 0
+  while True:
+    start_index, bench_version = FindBenchStart(results, test_start_pos)
+    if start_index == -1:
+      break
+    tests.append((start_index, bench_version))
+    test_start_pos = start_index + 1
+
+  # Now loop over individual tests collecting samples.
   samples = []
-  start_index, bench_version = FindBenchStart(results)
-  while start_index != -1:
-    next_start, next_bench = FindBenchStart(results, start_index + 1)
-    result = results[start_index:next_start]
+  for test_num, (start_index, bench_version) in enumerate(tests):
+    # Get end index - either start of next test, or None for the last test.
+    end_index = None
+    if test_num + 1 < len(tests):
+      end_index = tests[test_num + 1][0]
+    result = results[start_index:end_index]
 
     metadata = {'bench_version': bench_version}
 
-    platform_metadata, result = ExtractPlatform(result, bench_version)
+    # Assume that the result consists of overall score followed by
+    # specific scores and then platform metadata.
+
+    # Get the metadata first since we need that to annotate samples.
+    platform_metadata, meta_start = ExtractPlatform(result, bench_version)
     metadata.update(platform_metadata)
 
-    score, label, result = ExtractScore(result, bench_version)
+    # Get the overall score.
+    score, label, score_end = ExtractScore(result, bench_version)
     samples.append(sample.Sample(label, score, 'Mflops', metadata))
 
-    datapoints = ExtractResults(result, bench_version)
+    # For the specific scores, only look at the part of the string
+    # bounded by score_end and meta_start to avoid adding extraneous
+    # items. The overall score and platform data would match the
+    # result regex.
+    datapoints = ExtractResults(result[score_end:meta_start], bench_version)
     for metric, value in datapoints:
       samples.append(sample.Sample(metric, value, 'Mflops', metadata))
 
-    start_index, bench_version = next_start, next_bench
-
-  return samples
-
-
-def TestParseResults():
-  TEST_C = """**                                                              **
-** SciMark2 Numeric Benchmark, see http://math.nist.gov/scimark **
-** for details. (Results can be submitted to pozo@nist.gov)     **
-**                                                              **
-Using       2.00 seconds min time per kenel.
-Composite Score:         1596.04
-FFT             Mflops:  1568.64    (N=1024)
-SOR             Mflops:  1039.98    (100 x 100)
-MonteCarlo:     Mflops:   497.64
-Sparse matmult  Mflops:  1974.39    (N=1000, nz=5000)
-LU              Mflops:  2899.56    (M=100, N=100)
-"""
-  TEST_JAVA = """SciMark 2.0a
-
-Composite Score: 1716.3662351463677
-FFT (1024): 1000.1380057152871
-SOR (100x100):   1353.1987180103354
-Monte Carlo : 727.7138820888014
-Sparse matmult (N=1000, nz=5000): 1495.40225150659
-LU (100x100): 4005.3783184108247
-
-java.vendor: Oracle Corporation
-java.version: 1.7.0_75
-os.arch: amd64
-os.name: Linux
-os.version: 3.16.0-25-generic
-"""
-  samples = []
-  samples.extend(ParseResults(TEST_C))
-  samples.extend(ParseResults(TEST_JAVA))
   return samples
